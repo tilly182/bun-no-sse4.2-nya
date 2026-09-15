@@ -158,13 +158,31 @@ jobs:
       # it maps C flags to rustc flags, so -march=barcelona becomes
       # -Ctarget-cpu=barcelona by itself (rust.ts: -mcpu=X|-march=X -> -Ctarget-cpu=$value).
       # Both seds stay so the recipe survives an upstream revert of either form.
-      - name: Patch -march=nehalem -> -march=barcelona
+      # Three patches, each with a source citation. bun's x64 floor is nehalem
+      # (flags.ts:71 "-march=nehalem ... no AVX, broadest compatibility"), i.e. SSE4.1.
+      # K10 = SSE3 + SSE4a + ABM/POPCNT and NOT SSSE3, so SIMD levels drop to SSE2.
+      # Vendored SIMD that already CPUID-dispatches needs nothing:
+      #   deps/libwebp.ts:101  per-file -mavx2/-msse4.1/-msse2 + "runtime CPU dispatch
+      #                        in dsp/cpu.c ... still runs on pre-AVX2 hardware"
+      #   deps/zlib.ts:77-79   per-file -mssse3/-msse4.1/-msse4.2 with X86_* defines
+      #   deps/libjpeg-turbo.ts:8  jsimd.c "picks between them per call from cpuid"
+      # deps/libspng.ts:37 does NOT dispatch: it hardcodes SPNG_SSE: 4 ("4 = SSE4.1
+      # defilter paths (pabsw/pblendvb); our x64 floor is nehalem"), which makes
+      # always_inline _mm_blendv_epi8 fail to compile under -march=barcelona.
+      - name: Patch nehalem -> barcelona (codegen + Rust + non-dispatching SIMD)
         run: |
           cd /tmp/bun
           sed -i 's/"-march=nehalem"/"-march=barcelona"/' scripts/build/flags.ts
           sed -i 's/? "nehalem"/? "barcelona"/' scripts/build/rust.ts
+          sed -i 's/{ SPNG_SSE: 4 }/{ SPNG_SSE: 2 }/' scripts/build/deps/libspng.ts
           test "$(grep -c -- '-march=barcelona' scripts/build/flags.ts)" -ge 1 || {
             echo "::error::flags.ts anchor moved upstream; the sed is a silent no-op"; exit 1; }
+          grep -n 'SPNG_SSE: 2' scripts/build/deps/libspng.ts || {
+            echo "::error::libspng.ts SPNG_SSE anchor moved"; exit 1; }
+          # any dep config still pinning a non-dispatched SIMD level above SSE3 would
+          # SIGILL or fail to compile; fail here rather than 800 objects in.
+          left=$(grep -RnoE 'SPNG_SSE: [3-9]|USE_SSE4[12][^_A-Za-z]' scripts/build/ || true)
+          test -z "$left" || { echo "::error::undispatched SSE4.x constant remains: $left"; exit 1; }
           grep -n -A2 'flag: "-march=barcelona"' scripts/build/flags.ts
 
       - name: WebKit source @ the tag's pin
