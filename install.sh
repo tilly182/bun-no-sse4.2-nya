@@ -56,9 +56,9 @@ for f in bun bun-barcelona lib; do
     cp -f "$tmp/$f" "$HOME_DIR/$f.new"; mv -f "$HOME_DIR/$f.new" "$HOME_DIR/$f"
   fi
 done
-chmod +x "$HOME_DIR/bun" "$HOME_DIR/bun-barcelona" 2>/dev/null || true
+chmod +x "$HOME_DIR/bun" "$HOME_DIR/bun-barcelona"
 
-# The wrapper sets LD_LIBRARY_PATH for the bundled ICU; call it, never the ELF.
+# bun is the wrapper; the ELF (bun-barcelona) has no RPATH, so it needs bun's env.
 [ -n "$BIN_DIR" ] && { mkdir -p "$BIN_DIR"; ln -sf "$HOME_DIR/bun" "$BIN_DIR/bun"; say "on PATH: $BIN_DIR/bun"; }
 
 say "version : $("$HOME_DIR/bun" --version)"

@@ -263,11 +263,15 @@ jobs:
             test -f "$src" || { echo "::error::$l.so.$ICU_SONAME absent; runner ICU changed"; ls -1 /usr/lib/x86_64-linux-gnu/libicu*; exit 1; }
             cp -L "$src" dist/lib/
           done
+          # The wrapper is load-bearing, not decoration: `readelf -d` shows no
+          # RPATH/RUNPATH on the ELF, so ICU resolves only via LD_LIBRARY_PATH. Void's
+          # system ICU is 77/78, so the shipped .74 set must be injected. `bun` is the
+          # wrapper, `bun-barcelona` the ELF -- and $ORIGIN/lib is NOT a fallback.
           printf '%s\n' '#!/bin/sh' \
-            'DIR=$(cd "$(dirname "$0")" && pwd)' \
+            'DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)' \
             'export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
             'exec "$DIR/bun-barcelona" "$@"' > dist/bun
-          chmod +x dist/bun
+          chmod +x dist/bun dist/bun-barcelona
 
       # Stable asset name: releases/latest/download/bun-barcelona-linux-x64.tar.gz
       # never changes, so one link always yields the newest barcelona build.
