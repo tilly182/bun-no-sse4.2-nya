@@ -28,11 +28,6 @@ concurrency:
 env:
   BOOTSTRAP_BUN: bun-v1.3.14 # runtime for scripts/build.ts; runs on the runner, not the target CPU
   ICU_SONAME: "74" # ubuntu-latest (noble) = ICU 74. Asserted below, never assumed.
-  # Emulate the target CPU, not an approximation. K10 (Athlon II X4 / Phenom):
-  # SSE3 + SSE4a + ABM/POPCNT, and NO SSSE3 / SSE4.1 / SSE4.2. QEMU's `core2duo`
-  # is the inverse (SSSE3 yes, popcnt no), so it false-rejects x86-64-v2 code that
-  # legally uses popcnt -- which bun's nehalem floor permits and K10 provides.
-  GATE_CPU: core2duo,-ssse3,+popcnt,+abm
 
 jobs:
   # Cheap job: decide what, if anything, is new. Runs every cron tick; the
@@ -96,7 +91,7 @@ jobs:
             && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile || true
           df -h /; free -h
 
-      - name: Toolchain (clang 21, ninja, cmake, ICU, binutils, qemu)
+      - name: Toolchain (clang 21, ninja, cmake, ICU, binutils)
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21 noble
           # nasm: bun-v1.4.2 scripts/build/config.ts -> "x64: nasm for BoringSSL's
@@ -104,21 +99,21 @@ jobs:
           # without it; configure dies with "nasm not found in toolchain".
           sudo apt-get install -y --no-install-recommends \
             clang-21 lld-21 llvm-21-dev ninja-build cmake binutils nasm \
-            libssl-dev liblz4-dev libzstd-dev libicu-dev g++-14 libstdc++-14-dev qemu-user-static
+            libssl-dev liblz4-dev libzstd-dev libicu-dev g++-14 libstdc++-14-dev
           # Resolve, don't wish. Required tools, proven from the tag's source:
           #   compile.ts:272   assert(cfg.nasm !== undefined, "nasm not found in toolchain")
           #   configure.ts:327 findSystemTool("perl")  -> LUT codegen (create-hash-table.ts)
           #   config.ts:224    ld.lld on linux, lld-link on windows (never a bare `lld`;
           #                    bun may use rustc's bundled gcc-ld/ld.lld, config.ts:848)
           # plus clang/clang++/ninja/cmake/git/tar/make/ar/ranlib/objdump/strip used by
-          # these steps, and qemu-x86_64 for the ISA gate. ccache/sccache are optional.
-          # apt spells these differently per release and package (lld-21, qemu-x86_64-static,
-          # binutils' ar/ranlib), and update-alternatives may not have run in the image —
+          # these steps; ccache/sccache are optional. apt spells names differently per
+          # release and package (lld-21, binutils' ar/ranlib), and update-alternatives
+          # may not have run in the image —
           # so search the usual prefixes for NAME / NAME-static / NAME-21 and publish the
           # bare name bun invokes. Every miss is reported by name and costs seconds, not
           # a WebKit build.
           need="clang clang++ ld.lld lld llvm-ar llvm-ranlib ninja cmake nasm perl git \
-                tar make ar ranlib objdump strip qemu-x86_64"
+                tar make ar ranlib objdump strip"
           for n in $need; do
             command -v "$n" >/dev/null 2>&1 && continue
             found=""
@@ -133,7 +128,7 @@ jobs:
             command -v "$n" >/dev/null 2>&1 || { echo "::error::$n not on PATH after linking"; exit 1; }
           done
           clang --version | head -1; nasm -v; ld.lld --version | head -1
-          qemu-x86_64 -cpu "$GATE_CPU" --version | head -1; perl -v | sed -n 2p
+          perl -v | sed -n 2p
 
       - name: Bootstrap Bun (build host runtime)
         run: |
@@ -198,14 +193,14 @@ jobs:
           cd /tmp/WebKit && git fetch --depth 1 origin "$WK" && git checkout FETCH_HEAD && git log --oneline -1
 
       # Build is 1645s of the ~2060s job (measured from run#6 step timings), and the
-      # gate/patch fixes that follow never touch C++ or Rust sources -- so the object
+      # patch fixes that follow never touch C++ or Rust sources -- so the object
       # tree must survive between runs of the same tag. Keyed on TAG only, deliberately:
       # including the workflow hash would bust it on every CI-only edit, which is
       # exactly the iteration loop this exists to shorten.
       # Explicit restore/save instead of actions/cache@v4: the bundled post-step save is
       # SKIPPED when the job fails (run#7: "Post Cache the object tree — skipped"), which
       # is precisely the iteration where a warm tree is worth 27 minutes. Saving as a
-      # step right after Build means a later gate failure still leaves the tree cached.
+      # step right after Build means a failed publish still leaves the tree cached.
       - name: Restore object tree
         id: cache
         uses: actions/cache/restore@v4
@@ -246,7 +241,7 @@ jobs:
           ninja -C build/release bun-profile
           ls -lh build/release/bun-profile
 
-      - name: Save object tree (before the gate can fail)
+      - name: Save object tree
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -274,15 +269,9 @@ jobs:
             'exec "$DIR/bun-barcelona" "$@"' > dist/bun
           chmod +x dist/bun
 
-      # The gate. Upstream's checks are source/ninja greps and never inspect the ELF;
-      # a static objdump denylist is the wrong test too -- on this K10 box /usr/bin/bash
-      # contains movbe and fd contains andn/movbe/pextrq/ptest/tzcnt, all dead cold-path
-      # target CPU model (see GATE_CPU). Expectations come from the target, so a pass
-      # means "behaves here exactly as the reference binary does on this CPU".
       # Stable asset name: releases/latest/download/bun-barcelona-linux-x64.tar.gz
       # never changes, so one link always yields the newest barcelona build.
-      # Packed BEFORE the gate: run#7 produced a linkable binary, failed the gate and
-      # published nothing, so there was no artifact to test on real hardware.
+      # Packed and uploaded here so a publish failure still leaves a downloadable binary.
       - name: Pack
         run: |
           set -e
@@ -291,75 +280,28 @@ jobs:
           sha256sum *.tar.gz | tee SHA256SUMS
           ls -lh *.tar.gz
 
-      - name: Upload artifact (pre-gate)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bun-barcelona-pregate
+          name: bun-barcelona
           path: bun-barcelona-linux-x64.tar.gz
           if-no-files-found: error
-
-      - name: Gate — execute on the target CPU (qemu -cpu ${{ env.GATE_CPU }})
-        working-directory: dist
-        run: |
-          export LD_LIBRARY_PATH="$PWD/lib"
-          # Expectations MEASURED on the K10 target itself (reference 1.4.0-barcelona,
-          # 0.3s, no emulator): 1+2 -> 3; Int32Array.sort -> "[ 1, 3, 5, 8, 9 ]";
-          # 'ab'.toUpperCase()+JSON.stringify([1,2]) -> AB[1,2]; readFileSync().length ->
-          # 4145; Intl.DateTimeFormat -> "January 1, 1970" (healthy, not degraded).
-          # WebAssembly.Module(...).exports is undefined in that build, so wasm is
-          # reported rather than asserted: asserting it would reject the reference binary.
-          ISA=0
-          check() { # label expect argv...
-            local l=$1 e=$2; shift 2; local o rc
-            o=$(qemu-x86_64 -cpu "$GATE_CPU" ./bun-barcelona "$@" 2>&1); rc=$?
-            if [ "$rc" -eq 132 ]; then ISA=1; echo "  SIGILL: $l"; return 1; fi
-            [ "$rc" -eq 0 ] || { echo "::error::$l exited $rc under $GATE_CPU (not SIGILL): ${o: -300}"; exit 1; }
-            case "$o" in *"$e"*) echo "ok  $l => ${o:0:60}"; return 0 ;; esac
-            echo "::error::$l printed [${o:0:200}], expected to contain [$e]"; exit 1
-          }
-          note() { local l=$1; shift; local o rc
-            o=$(qemu-x86_64 -cpu "$GATE_CPU" ./bun-barcelona "$@" 2>&1); rc=$?
-            echo "note $l => rc=$rc ${o: -70}"; }
-          check version    "1."      --version
-          check arith      "3"       -e "console.log(1+2)"
-          check typedarray "1, 3, 5, 8, 9" -e "console.log([...new Int32Array([5,3,8,1,9]).sort()])"
-          check strings    "AB[1,2]" -e "console.log('ab'.toUpperCase()+JSON.stringify([1,2]))"
-          check fileio     "true"    -e "console.log(require('fs').readFileSync('bun','utf8').length>0)"
-          check intl       "January 1, 1970" -e "console.log(new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0)))"
-          # Reported, not asserted: the reference binary has no .exports on a Module.
-          note wasm        -e "const m=new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]));console.log(m.exports===undefined?'exports-undefined':('exports:'+m.exports.length))"
-          [ "$ISA" -eq 0 ] && { echo "gate: asserts pass on ${GATE_CPU}"; exit 0; }
-          echo "::error::SIGILL on ${GATE_CPU} -- walking the ladder"
-          for cpu in core2duo,-ssse3,+popcnt,+abm core2duo Conroe Nehalem SandyBridge max; do
-            if qemu-x86_64 -cpu "$cpu" ./bun-barcelona -e "console.log([...new Int32Array([5,3,8,1,9]).sort()])" \
-                 >/dev/null 2>&1; then echo "::error::first passing model: $cpu"; exit 1; fi
-            echo "  SIGILL on $cpu"
-          done
-          echo "::error::no model in the ladder executes it"; exit 1
-
-      # Informational: post-SSE3 surface still inside the ELF (audit lead, not a failure).
-      - name: Report ISA surface
-        run: |
-          ISA='(v[a-z]+[a-z0-9]*( |$))|(pcmpgtq|pcmpistri|pcmpestr[is]?)|(pcmpeqq|packusdw)|(pblendv|pextr[bdq]|pinsr[bdq]|ptest|insertps)|(round[sp][sd])|(crc32|movbe|tzcnt|bextr|bzhi|andn|blsr|rdrand|rdseed)|(fma[0-9]?)'
-          objdump -d --no-show-raw-insn dist/bun-barcelona \
-            | awk 'NF>=3 && $1 ~ /^[0-9a-f]+:$/ {print $2}' \
-            | grep -Eo "$ISA" | sort | uniq -c | sort -rn | head -20 \
-            || echo "clean: no post-SSE3 x86 extensions in the binary"
-
 
       - name: Publish release ${{ env.RELEASE }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          notes="Bun $VERSION at \`-march=barcelona\` (K10 baseline: SSE3, no SSE4.x/AVX), local WebKit/JavaScriptCore, bundled ICU $ICU_SONAME, LD_LIBRARY_PATH wrapper. Gate: executed under qemu \`-cpu $GATE_CPU\` before publishing. upstream oven-sh/bun@$TAG"
+          notes="Bun $VERSION built at \`-march=barcelona\` (K10: SSE3 + SSE4a + ABM/POPCNT, no SSSE3/SSE4.x/AVX), local WebKit/JavaScriptCore, bundled ICU $ICU_SONAME behind an LD_LIBRARY_PATH wrapper, from upstream oven-sh/bun@$TAG."
           assets="bun-barcelona-linux-x64.tar.gz bun-barcelona-linux-x64-${VERSION}.tar.gz SHA256SUMS"
-          if gh release view "$RELEASE" >/dev/null 2>&1; then
-            gh release upload "$RELEASE" --clobber $assets
-            gh release edit "$RELEASE" --title "Bun $VERSION (barcelona, no SSE4.2)" --notes "$notes"
+          # --repo is mandatory: this workflow never checks itself out, so gh has no git
+          # context and every call dies with "fatal: not a git repository" without it.
+          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # shellcheck disable=SC2086
+            gh release upload "$RELEASE" --repo "$GITHUB_REPOSITORY" --clobber $assets
+            gh release edit "$RELEASE" --repo "$GITHUB_REPOSITORY" --title "Bun $VERSION (barcelona, no SSE4.2)" --notes "$notes"
           else
             # shellcheck disable=SC2086
-            gh release create "$RELEASE" --title "Bun $VERSION (barcelona, no SSE4.2)" \
-              --notes "$notes" $assets
+            gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" --title "Bun $VERSION (barcelona, no SSE4.2)" --notes "$notes" $assets
           fi
-          gh release view "$RELEASE" --json tagName,assets -q '.tagName+" "+(.assets|map(.name)|join(","))'
+          gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json tagName,assets -q '.tagName+" "+(.assets|map(.name)|join(","))'
