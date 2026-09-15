@@ -202,14 +202,20 @@ jobs:
       # tree must survive between runs of the same tag. Keyed on TAG only, deliberately:
       # including the workflow hash would bust it on every CI-only edit, which is
       # exactly the iteration loop this exists to shorten.
-      - name: Cache the object tree
-        uses: actions/cache@v4
+      # Explicit restore/save instead of actions/cache@v4: the bundled post-step save is
+      # SKIPPED when the job fails (run#7: "Post Cache the object tree — skipped"), which
+      # is precisely the iteration where a warm tree is worth 27 minutes. Saving as a
+      # step right after Build means a later gate failure still leaves the tree cached.
+      - name: Restore object tree
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             /tmp/bun/build
             /tmp/WebKit
           key: obj-${{ env.TAG }}-llvm21
           restore-keys: obj-${{ env.TAG }}-
+
 
       # ninja compares mtimes. A fresh clone is newer than cache-restored objects, which
       # would rebuild all 1247 targets and make the cache worthless. Pin both source
@@ -239,6 +245,15 @@ jobs:
           export RUSTUP_TOOLCHAIN="$RUST_NIGHTLY" CC=/usr/lib/llvm-21/bin/clang CXX=/usr/lib/llvm-21/bin/clang++
           ninja -C build/release bun-profile
           ls -lh build/release/bun-profile
+
+      - name: Save object tree (before the gate can fail)
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /tmp/bun/build
+            /tmp/WebKit
+          key: obj-${{ env.TAG }}-llvm21
 
       - name: Dist (binary + bundled ICU + wrapper)
         run: |
