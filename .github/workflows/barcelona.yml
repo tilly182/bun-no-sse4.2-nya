@@ -302,13 +302,12 @@ jobs:
         working-directory: dist
         run: |
           export LD_LIBRARY_PATH="$PWD/lib"
-          # Expectations below were MEASURED by executing the reference 1.4.0 barcelona
-          # binary natively on the K10 target (0.8s, no emulator), not guessed:
-          # arithmetic -> 3, Int32Array.sort -> "[ 1, 3, 5, 8, 9 ]", string+JSON ->
-          # "AB[1,2]", readFileSync -> true. In that build Intl.DateTimeFormat and
-          # WebAssembly are degraded on the target itself (empty / TypeError: undefined
-          # is not an object), so they are reported and never asserted: asserting a path
-          # the reference CPU fails rejects every binary ever built.
+          # Expectations MEASURED on the K10 target itself (reference 1.4.0-barcelona,
+          # 0.3s, no emulator): 1+2 -> 3; Int32Array.sort -> "[ 1, 3, 5, 8, 9 ]";
+          # 'ab'.toUpperCase()+JSON.stringify([1,2]) -> AB[1,2]; readFileSync().length ->
+          # 4145; Intl.DateTimeFormat -> "January 1, 1970" (healthy, not degraded).
+          # WebAssembly.Module(...).exports is undefined in that build, so wasm is
+          # reported rather than asserted: asserting it would reject the reference binary.
           ISA=0
           check() { # label expect argv...
             local l=$1 e=$2; shift 2; local o rc
@@ -326,9 +325,9 @@ jobs:
           check typedarray "1, 3, 5, 8, 9" -e "console.log([...new Int32Array([5,3,8,1,9]).sort()])"
           check strings    "AB[1,2]" -e "console.log('ab'.toUpperCase()+JSON.stringify([1,2]))"
           check fileio     "true"    -e "console.log(require('fs').readFileSync('bun','utf8').length>0)"
-          # Degraded on the reference build on this CPU; reported so a 1.4.2 fix is visible.
-          note intl        -e "console.log(new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0)))"
-          note wasm        -e "console.log(new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])).exports.length)"
+          check intl       "January 1, 1970" -e "console.log(new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0)))"
+          # Reported, not asserted: the reference binary has no .exports on a Module.
+          note wasm        -e "const m=new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]));console.log(m.exports===undefined?'exports-undefined':('exports:'+m.exports.length))"
           [ "$ISA" -eq 0 ] && { echo "gate: asserts pass on ${GATE_CPU}"; exit 0; }
           echo "::error::SIGILL on ${GATE_CPU} -- walking the ladder"
           for cpu in core2duo,-ssse3,+popcnt,+abm core2duo Conroe Nehalem SandyBridge max; do
