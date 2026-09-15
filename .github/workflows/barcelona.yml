@@ -101,26 +101,35 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang-21 lld-21 llvm-21-dev ninja-build cmake binutils nasm \
             libssl-dev liblz4-dev libzstd-dev libicu-dev g++-14 libstdc++-14-dev qemu-user-static
-          # llvm-21's lld ships versioned; bun resolves the linker as `ld.lld` on
-          # linux (scripts/build/config.ts:224 "ld.lld on linux, lld-link on windows,
-          # ld64.lld when cross-compiling"), so expose the unversioned names.
-          for b in ld.lld lld llvm-ar llvm-ranlib; do
-            src="/usr/lib/llvm-21/bin/$b"
-            [ -e "$src" ] || src="/usr/lib/llvm-21/bin/${b}-21"
-            [ -e "$src" ] && ln -sf "$src" "/usr/local/bin/$b"
+          # Resolve, don't wish. Required tools, proven from the tag's source:
+          #   compile.ts:272   assert(cfg.nasm !== undefined, "nasm not found in toolchain")
+          #   configure.ts:327 findSystemTool("perl")  -> LUT codegen (create-hash-table.ts)
+          #   config.ts:224    ld.lld on linux, lld-link on windows (never a bare `lld`;
+          #                    bun may use rustc's bundled gcc-ld/ld.lld, config.ts:848)
+          # plus clang/clang++/ninja/cmake/git/tar/make/ar/ranlib/objdump/strip used by
+          # these steps, and qemu-x86_64 for the ISA gate. ccache/sccache are optional.
+          # apt spells these differently per release and package (lld-21, qemu-x86_64-static,
+          # binutils' ar/ranlib), and update-alternatives may not have run in the image —
+          # so search the usual prefixes for NAME / NAME-static / NAME-21 and publish the
+          # bare name bun invokes. Every miss is reported by name and costs seconds, not
+          # a WebKit build.
+          need="clang clang++ ld.lld lld llvm-ar llvm-ranlib ninja cmake nasm perl git \
+                tar make ar ranlib objdump strip qemu-x86_64"
+          for n in $need; do
+            command -v "$n" >/dev/null 2>&1 && continue
+            found=""
+            for d in /usr/local/bin /usr/bin /usr/lib/llvm-21/bin; do
+              for c in "$d/$n-static" "$d/$n-21" "$d/$n"; do
+                [ -x "$c" ] || continue
+                found="$c"; break 2
+              done
+            done
+            if [ -n "$found" ]; then sudo ln -sfn "$found" "/usr/local/bin/$n"; else
+              echo "::error::$n unavailable"; exit 1; fi
+            command -v "$n" >/dev/null 2>&1 || { echo "::error::$n not on PATH after linking"; exit 1; }
           done
-          # Assert ONLY what bun and these steps actually invoke, from source:
-          #   compile.ts:272  assert(cfg.nasm !== undefined, "nasm not found in toolchain")
-          #   configure.ts:327 findSystemTool("perl")  -> LUT codegen
-          #   config.ts:224   ld.lld (never a bare `lld`; bun may instead use rustc's
-          #                   bundled gcc-ld/ld.lld, config.ts:848)
-          # ccache/sccache are optional (used when present). A miss here costs 40s,
-          # not a WebKit build.
-          for t in clang clang++ ld.lld ninja cmake nasm perl git tar make ar ranlib \
-                   objdump strip qemu-x86_64; do
-            command -v "$t" >/dev/null || { echo "::error::$t missing"; exit 1; }
-          done
-          clang --version | head -1; nasm -v; ld.lld --version | head -1; qemu-x86_64 --version | head -1
+          clang --version | head -1; nasm -v; ld.lld --version | head -1
+          qemu-x86_64 --version | head -1; perl -v | sed -n 2p
 
       - name: Bootstrap Bun (build host runtime)
         run: |
