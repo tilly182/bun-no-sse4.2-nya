@@ -28,7 +28,11 @@ concurrency:
 env:
   BOOTSTRAP_BUN: bun-v1.3.14 # runtime for scripts/build.ts; runs on the runner, not the target CPU
   ICU_SONAME: "74" # ubuntu-latest (noble) = ICU 74. Asserted below, never assumed.
-  GATE_CPU: core2duo # SSE3-only: no SSE4.x, no popcnt -> stricter than K10 (SSE3 + SSE4a + ABM)
+  # Emulate the target CPU, not an approximation. K10 (Athlon II X4 / Phenom):
+  # SSE3 + SSE4a + ABM/POPCNT, and NO SSSE3 / SSE4.1 / SSE4.2. QEMU's `core2duo`
+  # is the inverse (SSSE3 yes, popcnt no), so it false-rejects x86-64-v2 code that
+  # legally uses popcnt -- which bun's nehalem floor permits and K10 provides.
+  GATE_CPU: core2duo,-ssse3,+popcnt,+abm
 
 jobs:
   # Cheap job: decide what, if anything, is new. Runs every cron tick; the
@@ -129,7 +133,7 @@ jobs:
             command -v "$n" >/dev/null 2>&1 || { echo "::error::$n not on PATH after linking"; exit 1; }
           done
           clang --version | head -1; nasm -v; ld.lld --version | head -1
-          qemu-x86_64 --version | head -1; perl -v | sed -n 2p
+          qemu-x86_64 -cpu "$GATE_CPU" --version | head -1; perl -v | sed -n 2p
 
       - name: Bootstrap Bun (build host runtime)
         run: |
@@ -230,24 +234,39 @@ jobs:
             'exec "$DIR/bun-barcelona" "$@"' > dist/bun
           chmod +x dist/bun
 
-      # The gate. Upstream's checks are source/ninja greps and never inspect the ELF,
-      # and a static objdump denylist is the wrong test either: on this K10 box
-      # /usr/bin/bash contains movbe and fd contains andn/movbe/pextrq/ptest/tzcnt --
-      # dead cold-path code that never executes. Presence != executed. So execute on a
-      # pre-SSE4.2 CPU. -cpu core2duo lacks SSE4.x AND popcnt, so clearing it implies
-      # clearing K10 (SSE3 + SSE4a + ABM/POPCNT).
-      - name: Gate — execute on pre-SSE4.2 (qemu ${{ env.GATE_CPU }})
+      # The gate. Upstream's checks are source/ninja greps and never inspect the ELF;
+      # a static objdump denylist is the wrong test too -- on this K10 box /usr/bin/bash
+      # contains movbe and fd contains andn/movbe/pextrq/ptest/tzcnt, all dead cold-path
+      # code. Presence != executed, so the only honest test is execution under the
+      # target CPU model (see GATE_CPU). Probes must contain no spaces: the `|` in each
+      # probe is rewritten to the argument boundary.
+      - name: Gate — execute on the target CPU (qemu -cpu ${{ env.GATE_CPU }})
         working-directory: dist
         run: |
           set -e
           export LD_LIBRARY_PATH="$PWD/lib"
-          g() { qemu-x86_64 -cpu "$GATE_CPU" ./bun-barcelona "$@" || { echo "::error::SIGILL on pre-SSE4.2"; exit 1; }; }
-          g --version
-          g -e "console.log(1+2)"
-          g -e "console.log([...new Int32Array([5,3,8,1,9]).sort()])"   # JSC typed-array path that used to SIGILL
-          g -e "console.log(new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0)))"
-          g -e "console.log('wasm', new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])).exports.length)"
-          g -e "const {readFileSync}=require('fs');console.log('fs',readFileSync('bun','utf8').length)"
+          # Each probe is labelled so a failure names the code path, and on failure
+          # the CPU ladder reports the first model that DOES pass -- that maps the
+          # defect to a feature tier instead of guessing from a bare SIGILL.
+          ladder=(core2duo,-ssse3,+popcnt,+abm core2duo Conroe Nehalem SandyBridge max)
+          probes=(--version
+                  "-e|console.log(1+2)"
+                  "-e|console.log([...new Int32Array([5,3,8,1,9]).sort()])"
+                  "-e|new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0))"
+                  "-e|new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])).exports.length"
+                  "-e|require('fs').readFileSync('bun','utf8').length")
+          run() { local cpu=$1; shift; local p; for p in "$@"; do
+                    qemu-x86_64 -cpu "$cpu" ./bun-barcelona ${p//|/ } >/dev/null || return 1
+                  done; }
+          if run "${ladder[0]}" "${probes[@]}"; then
+            echo "gate: all ${#probes[@]} probes execute on ${GATE_CPU}"
+          else
+            for cpu in "${ladder[@]}"; do
+              if run "$cpu" "${probes[@]}"; then echo "::error::target ${GATE_CPU} fails; first passing model: $cpu"; exit 1; fi
+              echo "  SIGILL on $cpu"
+            done
+            echo "::error::binary executes no CPU in the ladder (build-host issue?)"; exit 1
+          fi
 
       # Informational: post-SSE3 surface still inside the ELF (audit lead, not a failure).
       - name: Report ISA surface
