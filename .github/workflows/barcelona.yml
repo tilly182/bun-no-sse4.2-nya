@@ -95,12 +95,19 @@ jobs:
       - name: Toolchain (clang 21, ninja, cmake, ICU, binutils, qemu)
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21 noble
+          # nasm: bun-v1.4.2 scripts/build/config.ts -> "x64: nasm for BoringSSL's
+          # win-x64 assembly and libjpeg-turbo's x86_64 SIMD". ubuntu-latest ships
+          # without it; configure dies with "nasm not found in toolchain".
           sudo apt-get install -y --no-install-recommends \
-            clang-21 lld-21 llvm-21-dev ninja-build cmake binutils \
+            clang-21 lld-21 llvm-21-dev ninja-build cmake binutils nasm \
             libssl-dev liblz4-dev libzstd-dev libicu-dev g++-14 libstdc++-14-dev qemu-user-static
           sudo ln -sf /usr/bin/clang-21 /usr/local/bin/clang
           sudo ln -sf /usr/bin/clang++-21 /usr/local/bin/clang++
-          clang --version | head -1; qemu-x86_64 --version | head -1
+          # fail fast: a missing tool must not cost a WebKit build to discover
+          for t in clang clang++ lld ninja cmake nasm qemu-x86_64 objdump strip; do
+            command -v "$t" >/dev/null || { echo "::error::$t missing"; exit 1; }
+          done
+          clang --version | head -1; nasm -v; qemu-x86_64 --version | head -1
 
       - name: Bootstrap Bun (build host runtime)
         run: |
