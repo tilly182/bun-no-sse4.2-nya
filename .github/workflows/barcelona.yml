@@ -101,13 +101,26 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang-21 lld-21 llvm-21-dev ninja-build cmake binutils nasm \
             libssl-dev liblz4-dev libzstd-dev libicu-dev g++-14 libstdc++-14-dev qemu-user-static
-          sudo ln -sf /usr/bin/clang-21 /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-21 /usr/local/bin/clang++
-          # fail fast: a missing tool must not cost a WebKit build to discover
-          for t in clang clang++ lld ninja cmake nasm qemu-x86_64 objdump strip; do
+          # llvm-21's lld ships versioned; bun resolves the linker as `ld.lld` on
+          # linux (scripts/build/config.ts:224 "ld.lld on linux, lld-link on windows,
+          # ld64.lld when cross-compiling"), so expose the unversioned names.
+          for b in ld.lld lld llvm-ar llvm-ranlib; do
+            src="/usr/lib/llvm-21/bin/$b"
+            [ -e "$src" ] || src="/usr/lib/llvm-21/bin/${b}-21"
+            [ -e "$src" ] && ln -sf "$src" "/usr/local/bin/$b"
+          done
+          # Assert ONLY what bun and these steps actually invoke, from source:
+          #   compile.ts:272  assert(cfg.nasm !== undefined, "nasm not found in toolchain")
+          #   configure.ts:327 findSystemTool("perl")  -> LUT codegen
+          #   config.ts:224   ld.lld (never a bare `lld`; bun may instead use rustc's
+          #                   bundled gcc-ld/ld.lld, config.ts:848)
+          # ccache/sccache are optional (used when present). A miss here costs 40s,
+          # not a WebKit build.
+          for t in clang clang++ ld.lld ninja cmake nasm perl git tar make ar ranlib \
+                   objdump strip qemu-x86_64; do
             command -v "$t" >/dev/null || { echo "::error::$t missing"; exit 1; }
           done
-          clang --version | head -1; nasm -v; qemu-x86_64 --version | head -1
+          clang --version | head -1; nasm -v; ld.lld --version | head -1; qemu-x86_64 --version | head -1
 
       - name: Bootstrap Bun (build host runtime)
         run: |
