@@ -197,6 +197,31 @@ jobs:
           git clone --filter=blob:none --no-checkout https://github.com/oven-sh/WebKit.git /tmp/WebKit
           cd /tmp/WebKit && git fetch --depth 1 origin "$WK" && git checkout FETCH_HEAD && git log --oneline -1
 
+      # Build is 1645s of the ~2060s job (measured from run#6 step timings), and the
+      # gate/patch fixes that follow never touch C++ or Rust sources -- so the object
+      # tree must survive between runs of the same tag. Keyed on TAG only, deliberately:
+      # including the workflow hash would bust it on every CI-only edit, which is
+      # exactly the iteration loop this exists to shorten.
+      - name: Cache the object tree
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/bun/build
+            /tmp/WebKit
+          key: obj-${{ env.TAG }}-llvm21
+          restore-keys: obj-${{ env.TAG }}-
+
+      # ninja compares mtimes. A fresh clone is newer than cache-restored objects, which
+      # would rebuild all 1247 targets and make the cache worthless. Pin both source
+      # trees to a fixed past timestamp; the patch seds above have already run, and a
+      # genuine flag change still rebuilds because configure regenerates build.ninja.
+      - name: Age sources so restored objects are trusted
+        run: |
+          find /tmp/bun /tmp/WebKit -newermt "2000-01-02" \
+            -exec touch -h -d "2000-01-01T00:00:00" {} + 2>/dev/null || true
+          du -sh /tmp/bun/build 2>/dev/null || echo "cold tree for $TAG"
+          du -sh /tmp/WebKit 2>/dev/null || true
+
       - name: Configure (release, baseline, local WebKit)
         run: |
           cd /tmp/bun
@@ -243,11 +268,12 @@ jobs:
       - name: Gate — execute on the target CPU (qemu -cpu ${{ env.GATE_CPU }})
         working-directory: dist
         run: |
-          set -e
           export LD_LIBRARY_PATH="$PWD/lib"
-          # Each probe is labelled so a failure names the code path, and on failure
-          # the CPU ladder reports the first model that DOES pass -- that maps the
-          # defect to a feature tier instead of guessing from a bare SIGILL.
+          # run#6 lesson: swallowing stdout/stderr and treating every nonzero exit as
+          # SIGILL made a runtime failure indistinguishable from an ISA failure, on
+          # every CPU in the ladder including `max` -- i.e. the binary never started at
+          # all, which is not an SSE question. 132 = 128+SIGILL; anything else is a
+          # startup/env bug and must print the binary's own words.
           ladder=(core2duo,-ssse3,+popcnt,+abm core2duo Conroe Nehalem SandyBridge max)
           probes=(--version
                   "-e|console.log(1+2)"
@@ -255,18 +281,29 @@ jobs:
                   "-e|new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0))"
                   "-e|new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])).exports.length"
                   "-e|require('fs').readFileSync('bun','utf8').length")
-          run() { local cpu=$1; shift; local p; for p in "$@"; do
-                    qemu-x86_64 -cpu "$cpu" ./bun-barcelona ${p//|/ } >/dev/null || return 1
-                  done; }
-          if run "${ladder[0]}" "${probes[@]}"; then
-            echo "gate: all ${#probes[@]} probes execute on ${GATE_CPU}"
-          else
-            for cpu in "${ladder[@]}"; do
-              if run "$cpu" "${probes[@]}"; then echo "::error::target ${GATE_CPU} fails; first passing model: $cpu"; exit 1; fi
-              echo "  SIGILL on $cpu"
-            done
-            echo "::error::binary executes no CPU in the ladder (build-host issue?)"; exit 1
+          isa=0
+          for p in "${probes[@]}"; do
+            o=$(qemu-x86_64 -cpu "$GATE_CPU" ./bun-barcelona ${p//|/ } 2>&1) && continue
+            rc=$?
+            if [ "$rc" -ne 132 ]; then
+              echo "::error::probe [$p] exited $rc under $GATE_CPU -- not SIGILL; binary says: ${o: -400}"
+              exit 1
+            fi
+            isa=1; break
+          done
+          if [ "$isa" -eq 0 ]; then
+            echo "gate: executes on ${GATE_CPU}"; exit 0
           fi
+          echo "::error::SIGILL on ${GATE_CPU} -- walking the ladder"
+          for cpu in "${ladder[@]}"; do
+            ok=1
+            for p in "${probes[@]}"; do
+              qemu-x86_64 -cpu "$cpu" ./bun-barcelona ${p//|/ } >/dev/null 2>&1 || { ok=0; break; }
+            done
+            [ "$ok" -eq 1 ] && { echo "::error::first passing model: $cpu"; exit 1; }
+            echo "  SIGILL on $cpu"
+          done
+          echo "::error::no model in the ladder executes it"; exit 1
 
       # Informational: post-SSE3 surface still inside the ELF (audit lead, not a failure).
       - name: Report ISA surface
