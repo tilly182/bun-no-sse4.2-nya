@@ -1,0 +1,239 @@
+name: barcelona (auto build for every upstream Bun release)
+
+# Cron, not a webhook: upstream oven-sh/bun is a different repository, so its
+# release event cannot trigger this workflow. An hourly tag poll plus an
+# idempotent publish gives the same outcome with no inbound hook.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "upstream tag (bun-v1.4.2) or 'latest'"
+        default: "latest"
+        required: false
+      force:
+        description: "rebuild even if that -barcelona release already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: barcelona
+  cancel-in-progress: false
+
+env:
+  BOOTSTRAP_BUN: bun-v1.3.14 # runtime for scripts/build.ts; runs on the runner, not the target CPU
+  ICU_SONAME: "74" # ubuntu-latest (noble) = ICU 74. Asserted below, never assumed.
+  GATE_CPU: core2duo # SSE3-only: no SSE4.x, no popcnt -> stricter than K10 (SSE3 + SSE4a + ABM)
+
+jobs:
+  # Cheap job: decide what, if anything, is new. Runs every cron tick; the
+  # ~40-minute build only starts when an unshipped upstream tag exists.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+      release: ${{ steps.pick.outputs.release }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Resolve target tag + idempotency
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          want="${{ inputs.tag }}"
+          want="${want:-latest}"
+          if [ "$want" = "latest" ]; then
+            # live API today: bun-v1.4.2 bun-v1.4.1 bun-v1.4.0 bun-v1.3.14 ...
+            want=$(curl -fsSL https://api.github.com/repos/oven-sh/bun/tags?per_page=40 \
+              | grep -oE '"name": "bun-v[0-9][^"]*"' | cut -d'"' -f4 | sort -V | tail -1)
+          fi
+          test -n "$want" || { echo "::error::no upstream bun tag resolved"; exit 1; }
+          case "$want" in bun-v*) : ;; *) echo "::error::$want is not a bun-v* tag"; exit 1 ;; esac
+          ver="${want#bun-v}"
+          rel="v${ver}-barcelona"
+
+          build=true
+          if [ "${{ inputs.force }}" != "true" ] \
+             && gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+            echo "$rel already published -> build skipped (delete the release, or run with force, to rebuild)"
+          fi
+
+          {
+            echo "tag=$want"; echo "version=$ver"; echo "release=$rel"; echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+          echo "target $want -> release $rel (build=$build)"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE: ${{ needs.resolve.outputs.release }}
+    steps:
+      - name: Disk + swap for the WebKit+Bun link (~14 GB peak)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+                      /usr/local/share/boost /usr/local/.ghcup
+          sudo apt-get clean; sudo apt-get autoremove -y
+          sudo swapoff /swapfile 2>/dev/null || true; sudo rm -f /swapfile || true
+          (sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096) \
+            && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile || true
+          df -h /; free -h
+
+      - name: Toolchain (clang 21, ninja, cmake, ICU, binutils, qemu)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21 noble
+          sudo apt-get install -y --no-install-recommends \
+            clang-21 lld-21 llvm-21-dev ninja-build cmake binutils \
+            libssl-dev liblz4-dev libzstd-dev libicu-dev g++-14 libstdc++-14-dev qemu-user-static
+          sudo ln -sf /usr/bin/clang-21 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-21 /usr/local/bin/clang++
+          clang --version | head -1; qemu-x86_64 --version | head -1
+
+      - name: Bootstrap Bun (build host runtime)
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s "$BOOTSTRAP_BUN"
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Clone bun @ ${{ env.TAG }} (tag, not the moving default branch)
+        run: |
+          git clone --depth 1 --branch "$TAG" https://github.com/oven-sh/bun.git /tmp/bun
+          cd /tmp/bun && git describe --tags
+          NIGHTLY=$(awk -F'"' '/^channel/ {print $2}' rust-toolchain.toml)
+          test -n "$NIGHTLY" || { echo "::error::rust-toolchain.toml channel unreadable"; exit 1; }
+          echo "RUST_NIGHTLY=$NIGHTLY" >> "$GITHUB_ENV"
+          echo "rust $NIGHTLY (the tag's own pin, not a hardcoded date)"
+
+      - name: Rust (toolchain from the tag)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+            --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal \
+            --component rust-src,rustfmt,clippy,llvm-tools --target x86_64-unknown-linux-gnu
+
+      # One live patch. Upstream rust.ts has no "nehalem" literal (1.4.0 or 1.4.2);
+      # it maps C flags to rustc flags, so -march=barcelona becomes
+      # -Ctarget-cpu=barcelona by itself (rust.ts: -mcpu=X|-march=X -> -Ctarget-cpu=$value).
+      # Both seds stay so the recipe survives an upstream revert of either form.
+      - name: Patch -march=nehalem -> -march=barcelona
+        run: |
+          cd /tmp/bun
+          sed -i 's/"-march=nehalem"/"-march=barcelona"/' scripts/build/flags.ts
+          sed -i 's/? "nehalem"/? "barcelona"/' scripts/build/rust.ts
+          test "$(grep -c -- '-march=barcelona' scripts/build/flags.ts)" -ge 1 || {
+            echo "::error::flags.ts anchor moved upstream; the sed is a silent no-op"; exit 1; }
+          grep -n -A2 'flag: "-march=barcelona"' scripts/build/flags.ts
+
+      - name: WebKit source @ the tag's pin
+        run: |
+          WK=$(grep -oE 'WEBKIT_VERSION = "[0-9a-f]{40}"' /tmp/bun/scripts/build/deps/webkit.ts | grep -oE '[0-9a-f]{40}')
+          test -n "$WK" || { echo "::error::WEBKIT_VERSION pin format changed upstream"; exit 1; }
+          echo "WEBKIT_SHA=$WK" >> "$GITHUB_ENV"
+          git clone --filter=blob:none --no-checkout https://github.com/oven-sh/WebKit.git /tmp/WebKit
+          cd /tmp/WebKit && git fetch --depth 1 origin "$WK" && git checkout FETCH_HEAD && git log --oneline -1
+
+      - name: Configure (release, baseline, local WebKit)
+        run: |
+          cd /tmp/bun
+          export PATH="/usr/lib/llvm-21/bin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
+          export RUSTUP_TOOLCHAIN="$RUST_NIGHTLY" CC=/usr/lib/llvm-21/bin/clang CXX=/usr/lib/llvm-21/bin/clang++
+          export BUN_WEBKIT_PATH=/tmp/WebKit
+          bun scripts/build.ts --profile=release --baseline=true --webkit=local --configure-only --cacheDir=/tmp/bc
+          grep -m1 march=barcelona build/release/build.ninja || { echo "::error::C/C++ not barcelona"; exit 1; }
+          grep -m1 target-cpu=barcelona build/release/build.ninja || { echo "::error::Rust not barcelona"; exit 1; }
+
+      - name: Build
+        run: |
+          cd /tmp/bun
+          export PATH="/usr/lib/llvm-21/bin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
+          export RUSTUP_TOOLCHAIN="$RUST_NIGHTLY" CC=/usr/lib/llvm-21/bin/clang CXX=/usr/lib/llvm-21/bin/clang++
+          ninja -C build/release bun-profile
+          ls -lh build/release/bun-profile
+
+      - name: Dist (binary + bundled ICU + wrapper)
+        run: |
+          set -e
+          mkdir -p dist/lib
+          cp /tmp/bun/build/release/bun-profile dist/bun-barcelona
+          strip dist/bun-barcelona || true
+          # local-WebKit builds link ICU dynamically, so ship the runner's copy: the
+          # tarball then runs on hosts whose system ICU differs (Void ships ICU 78).
+          for l in libicui18n libicuuc libicudata; do
+            src="/usr/lib/x86_64-linux-gnu/$l.so.$ICU_SONAME"
+            test -f "$src" || { echo "::error::$l.so.$ICU_SONAME absent; runner ICU changed"; ls -1 /usr/lib/x86_64-linux-gnu/libicu*; exit 1; }
+            cp -L "$src" dist/lib/
+          done
+          printf '%s\n' '#!/bin/sh' \
+            'DIR=$(cd "$(dirname "$0")" && pwd)' \
+            'export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+            'exec "$DIR/bun-barcelona" "$@"' > dist/bun
+          chmod +x dist/bun
+
+      # The gate. Upstream's checks are source/ninja greps and never inspect the ELF,
+      # and a static objdump denylist is the wrong test either: on this K10 box
+      # /usr/bin/bash contains movbe and fd contains andn/movbe/pextrq/ptest/tzcnt --
+      # dead cold-path code that never executes. Presence != executed. So execute on a
+      # pre-SSE4.2 CPU. -cpu core2duo lacks SSE4.x AND popcnt, so clearing it implies
+      # clearing K10 (SSE3 + SSE4a + ABM/POPCNT).
+      - name: Gate — execute on pre-SSE4.2 (qemu ${{ env.GATE_CPU }})
+        working-directory: dist
+        run: |
+          set -e
+          export LD_LIBRARY_PATH="$PWD/lib"
+          g() { qemu-x86_64 -cpu "$GATE_CPU" ./bun-barcelona "$@" || { echo "::error::SIGILL on pre-SSE4.2"; exit 1; }; }
+          g --version
+          g -e "console.log(1+2)"
+          g -e "console.log([...new Int32Array([5,3,8,1,9]).sort()])"   # JSC typed-array path that used to SIGILL
+          g -e "console.log(new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0)))"
+          g -e "console.log('wasm', new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])).exports.length)"
+          g -e "const {readFileSync}=require('fs');console.log('fs',readFileSync('bun','utf8').length)"
+
+      # Informational: post-SSE3 surface still inside the ELF (audit lead, not a failure).
+      - name: Report ISA surface
+        run: |
+          ISA='(v[a-z]+[a-z0-9]*( |$))|(pcmpgtq|pcmpistri|pcmpestr[is]?)|(pcmpeqq|packusdw)|(pblendv|pextr[bdq]|pinsr[bdq]|ptest|insertps)|(round[sp][sd])|(crc32|movbe|tzcnt|bextr|bzhi|andn|blsr|rdrand|rdseed)|(fma[0-9]?)'
+          objdump -d --no-show-raw-insn dist/bun-barcelona \
+            | awk 'NF>=3 && $1 ~ /^[0-9a-f]+:$/ {print $2}' \
+            | grep -Eo "$ISA" | sort | uniq -c | sort -rn | head -20 \
+            || echo "clean: no post-SSE3 x86 extensions in the binary"
+
+      # Stable asset name: releases/latest/download/bun-barcelona-linux-x64.tar.gz
+      # never changes, so one link always yields the newest barcelona build.
+      - name: Pack
+        run: |
+          set -e
+          tar -C dist -czf "bun-barcelona-linux-x64-${VERSION}.tar.gz" .
+          cp -f "bun-barcelona-linux-x64-${VERSION}.tar.gz" bun-barcelona-linux-x64.tar.gz
+          sha256sum *.tar.gz | tee SHA256SUMS
+          ls -lh *.tar.gz
+
+      - name: Publish release ${{ env.RELEASE }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          notes="Bun $VERSION at \`-march=barcelona\` (K10 baseline: SSE3, no SSE4.x/AVX), local WebKit/JavaScriptCore, bundled ICU $ICU_SONAME, LD_LIBRARY_PATH wrapper. Gate: executed under qemu \`-cpu $GATE_CPU\` before publishing. upstream oven-sh/bun@$TAG"
+          assets="bun-barcelona-linux-x64.tar.gz bun-barcelona-linux-x64-${VERSION}.tar.gz SHA256SUMS"
+          if gh release view "$RELEASE" >/dev/null 2>&1; then
+            gh release upload "$RELEASE" --clobber $assets
+            gh release edit "$RELEASE" --title "Bun $VERSION (barcelona, no SSE4.2)" --notes "$notes"
+          else
+            # shellcheck disable=SC2086
+            gh release create "$RELEASE" --title "Bun $VERSION (barcelona, no SSE4.2)" \
+              --notes "$notes" $assets
+          fi
+          gh release view "$RELEASE" --json tagName,assets -q '.tagName+" "+(.assets|map(.name)|join(","))'
