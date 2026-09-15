@@ -262,45 +262,63 @@ jobs:
       # The gate. Upstream's checks are source/ninja greps and never inspect the ELF;
       # a static objdump denylist is the wrong test too -- on this K10 box /usr/bin/bash
       # contains movbe and fd contains andn/movbe/pextrq/ptest/tzcnt, all dead cold-path
-      # code. Presence != executed, so the only honest test is execution under the
-      # target CPU model (see GATE_CPU). Probes must contain no spaces: the `|` in each
-      # probe is rewritten to the argument boundary.
+      # target CPU model (see GATE_CPU). Expectations come from the target, so a pass
+      # means "behaves here exactly as the reference binary does on this CPU".
+      # Stable asset name: releases/latest/download/bun-barcelona-linux-x64.tar.gz
+      # never changes, so one link always yields the newest barcelona build.
+      # Packed BEFORE the gate: run#7 produced a linkable binary, failed the gate and
+      # published nothing, so there was no artifact to test on real hardware.
+      - name: Pack
+        run: |
+          set -e
+          tar -C dist -czf "bun-barcelona-linux-x64-${VERSION}.tar.gz" .
+          cp -f "bun-barcelona-linux-x64-${VERSION}.tar.gz" bun-barcelona-linux-x64.tar.gz
+          sha256sum *.tar.gz | tee SHA256SUMS
+          ls -lh *.tar.gz
+
+      - name: Upload artifact (pre-gate)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-barcelona-pregate
+          path: bun-barcelona-linux-x64.tar.gz
+          if-no-files-found: error
+
       - name: Gate — execute on the target CPU (qemu -cpu ${{ env.GATE_CPU }})
         working-directory: dist
         run: |
           export LD_LIBRARY_PATH="$PWD/lib"
-          # run#6 lesson: swallowing stdout/stderr and treating every nonzero exit as
-          # SIGILL made a runtime failure indistinguishable from an ISA failure, on
-          # every CPU in the ladder including `max` -- i.e. the binary never started at
-          # all, which is not an SSE question. 132 = 128+SIGILL; anything else is a
-          # startup/env bug and must print the binary's own words.
-          ladder=(core2duo,-ssse3,+popcnt,+abm core2duo Conroe Nehalem SandyBridge max)
-          probes=(--version
-                  "-e|console.log(1+2)"
-                  "-e|console.log([...new Int32Array([5,3,8,1,9]).sort()])"
-                  "-e|new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0))"
-                  "-e|new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])).exports.length"
-                  "-e|require('fs').readFileSync('bun','utf8').length")
-          isa=0
-          for p in "${probes[@]}"; do
-            o=$(qemu-x86_64 -cpu "$GATE_CPU" ./bun-barcelona ${p//|/ } 2>&1) && continue
-            rc=$?
-            if [ "$rc" -ne 132 ]; then
-              echo "::error::probe [$p] exited $rc under $GATE_CPU -- not SIGILL; binary says: ${o: -400}"
-              exit 1
-            fi
-            isa=1; break
-          done
-          if [ "$isa" -eq 0 ]; then
-            echo "gate: executes on ${GATE_CPU}"; exit 0
-          fi
+          # Expectations below were MEASURED by executing the reference 1.4.0 barcelona
+          # binary natively on the K10 target (0.8s, no emulator), not guessed:
+          # arithmetic -> 3, Int32Array.sort -> "[ 1, 3, 5, 8, 9 ]", string+JSON ->
+          # "AB[1,2]", readFileSync -> true. In that build Intl.DateTimeFormat and
+          # WebAssembly are degraded on the target itself (empty / TypeError: undefined
+          # is not an object), so they are reported and never asserted: asserting a path
+          # the reference CPU fails rejects every binary ever built.
+          ISA=0
+          check() { # label expect argv...
+            local l=$1 e=$2; shift 2; local o rc
+            o=$(qemu-x86_64 -cpu "$GATE_CPU" ./bun-barcelona "$@" 2>&1); rc=$?
+            if [ "$rc" -eq 132 ]; then ISA=1; echo "  SIGILL: $l"; return 1; fi
+            [ "$rc" -eq 0 ] || { echo "::error::$l exited $rc under $GATE_CPU (not SIGILL): ${o: -300}"; exit 1; }
+            case "$o" in *"$e"*) echo "ok  $l => ${o:0:60}"; return 0 ;; esac
+            echo "::error::$l printed [${o:0:200}], expected to contain [$e]"; exit 1
+          }
+          note() { local l=$1; shift; local o rc
+            o=$(qemu-x86_64 -cpu "$GATE_CPU" ./bun-barcelona "$@" 2>&1); rc=$?
+            echo "note $l => rc=$rc ${o: -70}"; }
+          check version    "1."      --version
+          check arith      "3"       -e "console.log(1+2)"
+          check typedarray "1, 3, 5, 8, 9" -e "console.log([...new Int32Array([5,3,8,1,9]).sort()])"
+          check strings    "AB[1,2]" -e "console.log('ab'.toUpperCase()+JSON.stringify([1,2]))"
+          check fileio     "true"    -e "console.log(require('fs').readFileSync('bun','utf8').length>0)"
+          # Degraded on the reference build on this CPU; reported so a 1.4.2 fix is visible.
+          note intl        -e "console.log(new Intl.DateTimeFormat('en',{dateStyle:'long'}).format(new Date(0)))"
+          note wasm        -e "console.log(new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])).exports.length)"
+          [ "$ISA" -eq 0 ] && { echo "gate: asserts pass on ${GATE_CPU}"; exit 0; }
           echo "::error::SIGILL on ${GATE_CPU} -- walking the ladder"
-          for cpu in "${ladder[@]}"; do
-            ok=1
-            for p in "${probes[@]}"; do
-              qemu-x86_64 -cpu "$cpu" ./bun-barcelona ${p//|/ } >/dev/null 2>&1 || { ok=0; break; }
-            done
-            [ "$ok" -eq 1 ] && { echo "::error::first passing model: $cpu"; exit 1; }
+          for cpu in core2duo,-ssse3,+popcnt,+abm core2duo Conroe Nehalem SandyBridge max; do
+            if qemu-x86_64 -cpu "$cpu" ./bun-barcelona -e "console.log([...new Int32Array([5,3,8,1,9]).sort()])" \
+                 >/dev/null 2>&1; then echo "::error::first passing model: $cpu"; exit 1; fi
             echo "  SIGILL on $cpu"
           done
           echo "::error::no model in the ladder executes it"; exit 1
@@ -314,15 +332,6 @@ jobs:
             | grep -Eo "$ISA" | sort | uniq -c | sort -rn | head -20 \
             || echo "clean: no post-SSE3 x86 extensions in the binary"
 
-      # Stable asset name: releases/latest/download/bun-barcelona-linux-x64.tar.gz
-      # never changes, so one link always yields the newest barcelona build.
-      - name: Pack
-        run: |
-          set -e
-          tar -C dist -czf "bun-barcelona-linux-x64-${VERSION}.tar.gz" .
-          cp -f "bun-barcelona-linux-x64-${VERSION}.tar.gz" bun-barcelona-linux-x64.tar.gz
-          sha256sum *.tar.gz | tee SHA256SUMS
-          ls -lh *.tar.gz
 
       - name: Publish release ${{ env.RELEASE }}
         env:
